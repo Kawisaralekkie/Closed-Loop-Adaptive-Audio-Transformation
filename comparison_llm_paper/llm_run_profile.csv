@@ -1,0 +1,4 @@
+config,model,temperature,max_tokens,n_llm_calls,speech_chunks,mean_trials,input_tokens,output_tokens,total_tokens,cost_usd,cost_per_speech_chunk_usd,mean_latency_ms,p50_latency_ms,p95_latency_ms
+LLM-Mem-SS,global.anthropic.claude-haiku-4-5-20251001-v1:0,0.1,512,4464,1121,3.982,11050787,1658618,12709405,21.2783,0.018982,4877.7,4965.9,5868.6
+LLM-Mem-NoSS,global.anthropic.claude-haiku-4-5-20251001-v1:0,0.1,512,4469,1121,3.987,10940561,1641981,12582542,21.0655,0.018792,4867.4,4966.1,5856.3
+LLM-NoMem-SS,global.anthropic.claude-haiku-4-5-20251001-v1:0,0.1,512,4471,1121,3.988,11019260,1739166,12758426,21.6866,0.019346,4959.6,4946.6,5843.7

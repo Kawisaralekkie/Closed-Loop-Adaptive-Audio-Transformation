@@ -1,0 +1,5 @@
+metric,memory_config,nomemory_config,n,test,mem_mean,mem_ci95_low,mem_ci95_high,nomem_mean,nomem_ci95_low,nomem_ci95_high,mean_diff(mem-nomem),diff_ci95_low,diff_ci95_high,statistic,p_value,cliffs_delta,significant_p<0.05
+Privacy Score,LLM-Mem-SS,LLM-NoMem-SS,1121,Mann-Whitney U (unpaired),0.3569,0.3411,0.3724,0.3467,0.3319,0.3616,0.0102,-0.0112,0.0316,6.337e+05,0.7236,0.0086,no
+Utility (TC@3+TA@1)/2,LLM-Mem-SS,LLM-NoMem-SS,1121,Mann-Whitney U (unpaired),0.7269,0.7135,0.7398,0.7288,0.7151,0.7416,-0.0019,-0.0207,0.0164,6.227e+05,0.6983,-0.0089,no
+Trials per chunk,LLM-Mem-SS,LLM-NoMem-SS,1121,Mann-Whitney U (unpaired),3.9822,3.9697,3.9929,3.9884,3.9786,3.9955,-0.0062,-0.0205,0.0080,6.272e+05,0.6497,-0.0018,no
+Source-separation rate,LLM-Mem-SS,LLM-NoMem-SS,1121,Mann-Whitney U (unpaired),0.1552,0.1347,0.1766,0.0776,0.0624,0.0937,0.0776,0.0517,0.1044,6.771e+05,1.019e-08,0.0776,yes
