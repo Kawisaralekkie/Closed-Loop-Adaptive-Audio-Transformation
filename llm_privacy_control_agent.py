@@ -1,4 +1,4 @@
-"""LLM-based Adaptive Privacy Control Agent using Claude 3.5 Haiku via Bedrock.
+"""LLM-based Adaptive Privacy Control Agent using Claude 4.5 Haiku via Bedrock.
 
 Upgraded from Reactive → Adaptive Agent with:
 - Cross-chunk memory: learns from previous chunks to improve decisions
@@ -421,7 +421,7 @@ Your job: choose the right audio blurring recipe and parameters to protect human
 def _get_bedrock_client():
     """Lazy-load boto3 Bedrock Runtime client."""
     import boto3
-    return boto3.client("bedrock-runtime", region_name="ap-southeast-1")
+    return boto3.client("bedrock-runtime", region_name="ap-xxxxxxxx-1")
 
 
 def _build_kb_context(kb: KnowledgeBase | None) -> str:
@@ -769,7 +769,7 @@ def _fallback_select(
 
 # ── Main Agent Class ──────────────────────────────────────────────────
 class LLMPrivacyControlAgent:
-    """Adaptive Privacy Control Agent powered by Claude 3.5 Haiku via Bedrock.
+    """Adaptive Privacy Control Agent powered by Claude 4.5 Haiku via Bedrock.
 
     Upgraded to Adaptive Agent level with cross-chunk learning:
     - Maintains ExperienceMemory across chunks within a run
