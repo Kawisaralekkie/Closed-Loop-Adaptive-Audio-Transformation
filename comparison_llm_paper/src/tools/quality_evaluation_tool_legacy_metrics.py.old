@@ -1,0 +1,79 @@
+"""LEGACY SNAPSHOT — proxy-only mAP / F1 / accuracy (pre-transfer-learning).
+
+This file preserves the ORIGINAL utility-metric implementation as it was
+BEFORE ground-truth (transfer-learning) support was added to
+``src/tools/quality_evaluation_tool.py``.
+
+It is kept for reference / rollback only and is NOT imported anywhere.
+At that time mAP/F1/accuracy were derived purely from the YAMNet confidence
+distribution (no ground-truth comparison):
+
+  - mAP      : mean confidence of the top-5 predictions
+  - f1       : harmonic-mean proxy from the top-1 confidence
+  - accuracy : top-1 confidence
+
+To restore the old behaviour, replace the ground-truth-aware
+``_compute_utility_metrics`` (and the ``UtilityMetrics`` extra fields) in the
+live files with the definitions below.
+
+------------------------------------------------------------------------------
+OLD  src/contracts/metrics_contracts.py :: UtilityMetrics
+------------------------------------------------------------------------------
+
+class UtilityMetrics(BaseModel):
+    \"\"\"Utility and preservation metrics.\"\"\"
+
+    mAP: float
+    f1: float
+    accuracy: float
+    preserve_score: float  # composite of sub-scores
+    sub_scores: PreserveSubScores
+
+------------------------------------------------------------------------------
+OLD  src/tools/quality_evaluation_tool.py :: _compute_utility_metrics
+------------------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_utility_metrics(classification_result: YamnetOutput) -> dict:
+        \"\"\"Derive utility metrics from classification output.
+
+        In production these would compare against ground-truth labels.
+        Here we use the classification confidence distribution as a proxy.
+
+        - mAP: mean confidence of top-5 predictions (avoids dilution
+          by hundreds of near-zero classes from YAMNet's 521-class output).
+        - f1: harmonic-mean proxy from top-1 confidence.
+        - accuracy: top-1 confidence.
+        \"\"\"
+        if not classification_result.predictions:
+            return {"mAP": 0.0, "f1": 0.0, "accuracy": 0.0}
+
+        confidences = [p.confidence for p in classification_result.predictions]
+        top_conf = confidences[0]
+        top5_conf = confidences[:5]
+        mean_top5 = float(np.mean(top5_conf))
+
+        return {
+            "mAP": float(np.clip(mean_top5, 0.0, 1.0)),
+            "f1": float(np.clip(2.0 * top_conf / (top_conf + 1.0 + 1e-12), 0.0, 1.0)),
+            "accuracy": float(np.clip(top_conf, 0.0, 1.0)),
+        }
+
+------------------------------------------------------------------------------
+OLD  run() utility block
+------------------------------------------------------------------------------
+
+        # --- Utility metrics (Req 6.4) ---
+        utility_raw = self._compute_utility_metrics(classification_result)
+
+        utility = UtilityMetrics(
+            mAP=utility_raw["mAP"],
+            f1=utility_raw["f1"],
+            accuracy=utility_raw["accuracy"],
+            preserve_score=preserve_score,
+            sub_scores=sub_scores,
+        )
+
+NOTE: ``run()`` and ``QualityEvaluationTool.__init__`` did NOT take a
+``ground_truth_label`` parameter in the old version.
+"""

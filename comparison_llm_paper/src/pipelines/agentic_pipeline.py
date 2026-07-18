@@ -1,0 +1,872 @@
+"""Agentic Pipeline — LLM-driven adaptive voice blurring orchestration.
+
+Orchestrates: PrepareDataTool → SpeechScanTool → routing →
+AdaptivePrivacyControlAgent → ClassificationTool →
+QualityEvaluationTool → DataLakeWriter.
+
+Loads the Knowledge Base via KnowledgeBaseLoader and passes it along with
+privacy_target to the agent.  Each chunk is processed independently;
+partial failures do not abort the run.
+
+NOTE (renamed 2026): privacy_target vocabulary
+    OLD VOCAB        NEW VOCAB     privacy_score_min
+    "high"      →    "moderate"    0.65
+    "very_high" →    "high"        0.80
+Legacy values are accepted via ``normalize_privacy_target()``.
+
+Requirements: 8.1–8.8, 9.7, 10.1–10.5, 11.1, 11.4, 12.1, 12.2, 15.1, 15.2
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import traceback
+from datetime import datetime, timezone
+from uuid import UUID
+
+from src.agents.adaptive_privacy_control_agent import AdaptivePrivacyControlAgent
+from src.config import AppConfig, config
+from src.tools.source_separation_tool import SourceSeparationTool
+from src.contracts.audio_contracts import AudioChunk, AudioIngestRequest
+from src.contracts.metrics_contracts import normalize_privacy_target
+from src.contracts.report_contracts import ChunkReport, RunReport
+from src.knowledge_base.kb_loader import KnowledgeBase, KnowledgeBaseLoader
+from src.security.audit_logger import AuditLogger
+from src.security.data_minimization import delete_raw_audio_files, enforce_retention_policy
+from src.tools.classification_tool import ClassificationTool
+from src.tools.data_lake_writer import DataLakeWriter
+from src.tools.prepare_data_tool import PrepareDataTool
+from src.tools.quality_evaluation_tool import QualityEvaluationTool
+from src.tools.speech_scan_tool import SpeechScanTool
+
+logger = logging.getLogger(__name__)
+
+
+class AgenticPipeline:
+    """Adaptive agentic processing pipeline backed by a Knowledge Base.
+
+    Parameters
+    ----------
+    privacy_target : str
+        ``"moderate"`` or ``"high"`` — forwarded to the agent.
+        Legacy values ``"high"``/``"very_high"`` are accepted and
+        normalized to ``"moderate"``/``"high"`` respectively.
+    kb_loader : KnowledgeBaseLoader | None
+        Loader for the S3-hosted Knowledge Base.  When *None* the caller
+        must supply a pre-loaded ``KnowledgeBase`` via *kb*.
+    kb : KnowledgeBase | None
+        Pre-loaded Knowledge Base (takes precedence over *kb_loader*).
+    prepare_data_tool : PrepareDataTool | None
+        Optional pre-constructed tool instance.
+    speech_scan_tool : SpeechScanTool | None
+        Optional pre-constructed tool instance.
+    agent : AdaptivePrivacyControlAgent | None
+        Optional pre-constructed agent instance.
+    classification_tool : ClassificationTool | None
+        Optional pre-constructed tool instance.
+    quality_tool : QualityEvaluationTool | None
+        Optional pre-constructed tool instance.
+    data_lake_writer : DataLakeWriter | None
+        Optional pre-constructed tool instance.
+    audit_logger : AuditLogger | None
+        Optional audit logger instance.
+    app_config : AppConfig | None
+        Override global config.
+    source_separation_tool : SourceSeparationTool | None
+        Optional pre-constructed SourceSeparationTool instance.
+        Used only with LLMPrivacyControlAgent (Agentic Pipeline).
+    """
+
+    def __init__(
+        self,
+        privacy_target: str = "moderate",
+        *,
+        kb_loader: KnowledgeBaseLoader | None = None,
+        kb: KnowledgeBase | None = None,
+        prepare_data_tool: PrepareDataTool | None = None,
+        speech_scan_tool: SpeechScanTool | None = None,
+        agent: AdaptivePrivacyControlAgent | None = None,
+        classification_tool: ClassificationTool | None = None,
+        quality_tool: QualityEvaluationTool | None = None,
+        data_lake_writer: DataLakeWriter | None = None,
+        audit_logger: AuditLogger | None = None,
+        app_config: AppConfig | None = None,
+        source_separation_tool: SourceSeparationTool | None = None,
+        ground_truth_label: str | None = None,
+    ) -> None:
+        # Normalize legacy values: old "high" → new "moderate",
+        # old "very_high" → new "high".
+        self._privacy_target = normalize_privacy_target(privacy_target)
+        self._cfg = app_config or config
+        self._kb_loader = kb_loader
+        self._kb = kb
+        self._prepare = prepare_data_tool
+        self._speech_scan = speech_scan_tool
+        self._agent = agent
+        self._classification = classification_tool
+        self._quality = quality_tool
+        self._writer = data_lake_writer
+        self._audit = audit_logger or AuditLogger()
+        # ── SOURCE SEPARATION GLOBALLY DISABLED ── ignore any tool passed in
+        self._source_separation_tool = None
+        # File-level ground-truth class (label1_audioset) for real
+        # mAP/F1/accuracy during transfer-learning evaluation. None → proxy.
+        self._ground_truth_label = ground_truth_label
+        # Dump full amplitude arrays as .npz artifacts when DUMP_AMPLITUDE_ARRAYS=true
+        self._dump_amplitude_arrays = (
+            os.environ.get("DUMP_AMPLITUDE_ARRAYS", "false").lower() == "true"
+        )
+
+    # ------------------------------------------------------------------
+    # Knowledge Base loading
+    # ------------------------------------------------------------------
+
+    def _load_kb(self, kb_version: str | None = None) -> KnowledgeBase:
+        """Return the Knowledge Base, loading from S3 if needed."""
+        if self._kb is not None:
+            return self._kb
+        if self._kb_loader is None:
+            raise RuntimeError(
+                "AgenticPipeline requires either a pre-loaded KnowledgeBase "
+                "or a KnowledgeBaseLoader"
+            )
+        self._kb = self._kb_loader.load(
+            s3_bucket=self._cfg.s3.bucket_name,
+            prefix=self._cfg.s3.prefix,
+            version=kb_version,
+        )
+        return self._kb
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def run(
+        self,
+        request: AudioIngestRequest,
+        timestamp: str | None = None,
+        kb_version: str | None = None,
+    ) -> RunReport:
+        """Execute the full agentic pipeline.
+
+        Parameters
+        ----------
+        request : AudioIngestRequest
+            Incoming audio ingestion request.
+        timestamp : str | None
+            ISO-8601 timestamp for deterministic run_id generation.
+        kb_version : str | None
+            Pin a specific Knowledge Base version.  ``None`` loads latest.
+
+        Returns
+        -------
+        RunReport
+            Comprehensive report with per-chunk details, KB version,
+            model versions, and succeeded/failed counts.
+        """
+        if timestamp is None:
+            timestamp = datetime.now(timezone.utc).isoformat()
+
+        started_at = datetime.now(timezone.utc)
+
+        # --- Load Knowledge Base (Req 9.7) ---
+        kb = self._load_kb(kb_version)
+
+        # --- Step 1: Ingest, validate, canonicalize, chunk ---
+        ingest_response = self._prepare.run(request, timestamp=timestamp)
+        run_id = ingest_response.run_id
+
+        self._audit.log(
+            run_id=run_id,
+            chunk_id="",
+            tool_name="PrepareDataTool",
+            decision_parameters={"source_id": request.source_id},
+            outcome=f"produced {len(ingest_response.chunks)} chunks",
+        )
+
+        # --- Step 2–6: Process each chunk independently (Req 14.2, 14.3) ---
+        chunk_reports: list[ChunkReport] = []
+        artifact_paths: list[str] = []
+        speech_chunk_paths: list[str] = []  # Track raw speech chunks for deletion
+
+        for chunk in ingest_response.chunks:
+            report, paths = self._process_chunk(chunk, run_id, kb)
+            chunk_reports.append(report)
+            artifact_paths.extend(paths)
+            # Track original chunk WAV paths that contained speech
+            if report.had_speech:
+                speech_chunk_paths.append(chunk.wav_path)
+
+        succeeded = sum(1 for r in chunk_reports if r.failure is None)
+        failed = sum(1 for r in chunk_reports if r.failure is not None)
+
+        # --- Aggregate LLM token usage across all chunks ---
+        total_input = sum(
+            (r.llm_token_usage or {}).get("input_tokens", 0) for r in chunk_reports
+        )
+        total_output = sum(
+            (r.llm_token_usage or {}).get("output_tokens", 0) for r in chunk_reports
+        )
+        total_llm_usage = {
+            "input_tokens": total_input,
+            "output_tokens": total_output,
+            "total_tokens": total_input + total_output,
+        } if (total_input + total_output) > 0 else None
+
+        # --- Build RunReport with reproducibility metadata (Req 15.1, 15.2) ---
+        finished_at = datetime.now(timezone.utc)
+        run_report = RunReport(
+            run_id=run_id,
+            source_id=request.source_id,
+            kb_version=kb.version,
+            model_versions={"silero_vad": "5.1", "yamnet": "1"},
+            config_params={
+                "privacy_target": self._privacy_target,
+                "sample_rate": self._cfg.audio.sample_rate,
+                "window_size": self._cfg.audio.window_size,
+                "overlap": self._cfg.audio.overlap,
+                "max_trials": self._cfg.agent.max_trials,
+                "kb_manifest_hash": kb.manifest_hash,
+            },
+            chunks=chunk_reports,
+            total_chunks=len(chunk_reports),
+            succeeded_chunks=succeeded,
+            failed_chunks=failed,
+            started_at=started_at.isoformat(),
+            created_at=finished_at.isoformat(),
+            total_runtime_seconds=round((finished_at - started_at).total_seconds(), 2),
+            total_llm_token_usage=total_llm_usage,
+        )
+
+        # --- Step 7: Persist to data lake ---
+        if self._writer is not None:
+            try:
+                persisted = self._writer.run(
+                    run_id=str(run_id),
+                    artifact_paths=artifact_paths,
+                    report=run_report,
+                )
+                run_report.persisted_paths = persisted
+                self._audit.log(
+                    run_id=run_id,
+                    chunk_id="",
+                    tool_name="DataLakeWriter",
+                    decision_parameters={"artifact_count": len(artifact_paths)},
+                    outcome=f"persisted {len(persisted)} paths",
+                )
+            except Exception as exc:
+                logger.error("DataLakeWriter failed: %s", exc)
+                self._audit.log(
+                    run_id=run_id,
+                    chunk_id="",
+                    tool_name="DataLakeWriter",
+                    decision_parameters={},
+                    outcome=f"error: {exc}",
+                )
+
+        # --- Step 8: Data minimization (Req 11.1) ---
+        if not kb.policies.allow_store_raw_audio:
+            delete_raw_audio_files(
+                raw_audio_path=request.raw_audio_path,
+                canonical_wav_path=ingest_response.canonical_audio.wav_path,
+                speech_chunk_paths=speech_chunk_paths,
+                audit_logger=self._audit,
+                run_id=run_id,
+            )
+
+        # --- Step 9: Retention policy enforcement (Req 11.4) ---
+        if self._writer is not None:
+            enforce_retention_policy(
+                base_path=self._writer._base_path,
+                max_retention_days=kb.policies.max_retention_days,
+                audit_logger=self._audit,
+                run_id=run_id,
+            )
+
+        return run_report
+
+
+    # ------------------------------------------------------------------
+    # Per-chunk processing
+    # ------------------------------------------------------------------
+
+    def _process_chunk(
+        self,
+        chunk: AudioChunk,
+        run_id: UUID,
+        kb: KnowledgeBase,
+    ) -> tuple[ChunkReport, list[str]]:
+        """Process a single chunk through the agentic pipeline.
+
+        Returns a ``(ChunkReport, artifact_paths)`` tuple.  Failures are
+        caught and recorded in the report rather than propagated (Req 14.2).
+        """
+        artifact_paths: list[str] = []
+
+        try:
+            # --- Speech detection (Req 2.1, 2.2) ---
+            vad_result = self._speech_scan.run(chunk)
+            self._audit.log(
+                run_id=run_id,
+                chunk_id=chunk.chunk_id,
+                tool_name="SpeechScanTool",
+                decision_parameters={
+                    "speech_ratio": vad_result.speech_ratio,
+                    "has_speech": vad_result.has_speech,
+                },
+                outcome="speech_detected" if vad_result.has_speech else "no_speech",
+            )
+
+            # --- Routing (Req 2.3, 2.4) ---
+            transform_result = None
+            chunk_report_from_agent: ChunkReport | None = None
+
+            if vad_result.has_speech:
+                # Delegate to the adaptive agent (Req 8.1–8.8)
+                transform_result, chunk_report_from_agent = self._agent.run(
+                    chunk=chunk,
+                    vad_result=vad_result,
+                    kb=kb,
+                    privacy_target=self._privacy_target,
+                )
+                artifact_paths.append(transform_result.blurred_wav_path)
+
+                self._audit.log(
+                    run_id=run_id,
+                    chunk_id=chunk.chunk_id,
+                    tool_name="AdaptivePrivacyControlAgent",
+                    decision_parameters={
+                        "recipe": transform_result.recipe_ref.recipe_name,
+                        "trial": transform_result.trial,
+                        "privacy_target": self._privacy_target,
+                    },
+                    outcome="blurred",
+                )
+
+                processed_chunk = AudioChunk(
+                    chunk_id=chunk.chunk_id,
+                    run_id=run_id,
+                    wav_path=transform_result.blurred_wav_path,
+                    start_time=chunk.start_time,
+                    end_time=chunk.end_time,
+                    duration=chunk.duration,
+                )
+            else:
+                processed_chunk = chunk
+
+            # --- Classification (Req 5.1–5.3) ---
+            classification_original = self._classification.run(chunk)
+            classification_result = self._classification.run(processed_chunk)
+            self._audit.log(
+                run_id=run_id,
+                chunk_id=chunk.chunk_id,
+                tool_name="ClassificationTool",
+                decision_parameters={
+                    "top_label": (
+                        classification_result.predictions[0].label
+                        if classification_result.predictions
+                        else "none"
+                    ),
+                },
+                outcome="classified",
+            )
+
+            # --- Quality evaluation (Req 6.1–6.6) ---
+            metrics_result = self._quality.run(
+                original_chunk=chunk,
+                processed_chunk=processed_chunk,
+                classification_result=classification_result,
+                privacy_target=self._privacy_target,
+                ground_truth_label=self._ground_truth_label,
+                had_speech=vad_result.has_speech,
+            )
+            self._audit.log(
+                run_id=run_id,
+                chunk_id=chunk.chunk_id,
+                tool_name="QualityEvaluationTool",
+                decision_parameters={
+                    "privacy_score": metrics_result.privacy.privacy_score,
+                    "preserve_score": metrics_result.utility.preserve_score,
+                    "overall_pass": metrics_result.decision.overall_pass,
+                },
+                outcome="pass" if metrics_result.decision.overall_pass else "fail",
+            )
+
+            # Compute VAD confidence mean for logging
+            vad_conf = (
+                sum(s.confidence for s in vad_result.segments) / len(vad_result.segments)
+                if vad_result.segments else 0.0
+            )
+
+            # Extract top-3 YAMNet predictions
+            top3 = [
+                {"label": p.label, "confidence": round(p.confidence, 4)}
+                for p in (classification_result.predictions or [])[:3]
+            ]
+            top3_orig = [
+                {"label": p.label, "confidence": round(p.confidence, 4)}
+                for p in (classification_original.predictions or [])[:3]
+            ]
+
+            # --- Amplitude-array stats (before/after transform) ---
+            amplitude_stats = None
+            try:
+                from src.tools.amplitude_logger import compute_amplitude_stats
+                amplitude_stats, amp_npz = compute_amplitude_stats(
+                    original_path=chunk.wav_path,
+                    processed_path=processed_chunk.wav_path,
+                    dump_full_array=self._dump_amplitude_arrays,
+                    chunk_id=chunk.chunk_id,
+                )
+                if amp_npz:
+                    artifact_paths.append(amp_npz)
+            except Exception as amp_exc:
+                logger.warning("Amplitude stats failed for %s: %s", chunk.chunk_id, amp_exc)
+
+            # Use the agent's chunk report if available (preserves recipe
+            # selection, trial count, and agent-level metrics); augment with
+            # the pipeline-level quality evaluation metrics.
+            if chunk_report_from_agent is not None:
+                report = ChunkReport(
+                    chunk_id=chunk.chunk_id,
+                    run_id=run_id,
+                    had_speech=True,
+                    speech_ratio=vad_result.speech_ratio,
+                    vad_confidence=vad_conf,
+                    recipe_applied=chunk_report_from_agent.recipe_applied,
+                    params_applied=chunk_report_from_agent.params_applied,
+                    trials=chunk_report_from_agent.trials,
+                    metrics=metrics_result,
+                    routing_decision="blurred",
+                    llm_token_usage=chunk_report_from_agent.llm_token_usage,
+                    trial_details=chunk_report_from_agent.trial_details,
+                    llm_responses=chunk_report_from_agent.llm_responses,
+                    memory_snapshot=chunk_report_from_agent.memory_snapshot,
+                    classification_top3=top3,
+                    classification_top3_original=top3_orig,
+                    used_source_separation=chunk_report_from_agent.used_source_separation,
+                    amplitude_stats=amplitude_stats,
+                    ground_truth_label=self._ground_truth_label,
+                )
+            else:
+                report = ChunkReport(
+                    chunk_id=chunk.chunk_id,
+                    run_id=run_id,
+                    had_speech=False,
+                    speech_ratio=vad_result.speech_ratio,
+                    vad_confidence=vad_conf,
+                    trials=0,
+                    metrics=metrics_result,
+                    routing_decision="bypass",
+                    classification_top3=top3,
+                    classification_top3_original=top3_orig,
+                    amplitude_stats=amplitude_stats,
+                    ground_truth_label=self._ground_truth_label,
+                )
+
+        except Exception as exc:
+            logger.error(
+                "Chunk %s failed: %s", chunk.chunk_id, exc, exc_info=True,
+            )
+            self._audit.log(
+                run_id=run_id,
+                chunk_id=chunk.chunk_id,
+                tool_name="AgenticPipeline",
+                decision_parameters={},
+                outcome=f"error: {exc}",
+            )
+            report = ChunkReport(
+                chunk_id=chunk.chunk_id,
+                run_id=run_id,
+                had_speech=False,
+                trials=0,
+                routing_decision="error",
+                failure=traceback.format_exc(),
+            )
+
+        return report, artifact_paths
+
+
+# ── CLI / ECS Entrypoint ─────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import os
+    import tempfile
+    import boto3
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    # Get S3 info from environment (set by Step Functions)
+    s3_bucket = os.environ.get("AUDIO_S3_BUCKET")
+    s3_key = os.environ.get("AUDIO_S3_KEY")
+    # privacy_target (renamed 2026):
+    #   NEW: "moderate" (was old "high",      threshold 0.65)
+    #   NEW: "high"     (was old "very_high", threshold 0.80)
+    # Default = "moderate" so existing callers without env var get the
+    # previous lighter behaviour. Legacy "very_high" is auto-aliased to "high".
+    privacy_target = os.environ.get("PRIVACY_TARGET", "moderate")
+    # RUN_MODE: comma-separated list or "all" (default)
+    # Valid modes: fixed, fixed_strong, rule_based, rule_based_strong, rule_based_ss,
+    #              llm_no_memory, llm_with_memory, llm_with_memory_no_ss, llm_no_memory_no_ss
+    # Example: "fixed,llm_with_memory_no_ss,llm_no_memory_no_ss"
+    run_mode_raw = os.environ.get("RUN_MODE", "all")
+    run_modes = set(m.strip() for m in run_mode_raw.split(","))
+
+    def should_run(mode: str) -> bool:
+        return "all" in run_modes or mode in run_modes
+
+    if not s3_bucket or not s3_key:
+        logger.error("Missing AUDIO_S3_BUCKET or AUDIO_S3_KEY environment variables")
+        raise SystemExit(1)
+
+    logger.info(f"Processing s3://{s3_bucket}/{s3_key}")
+
+    # ── Resolve file-level ground-truth label (transfer-learning eval) ──
+    # When GROUND_TRUTH_LABELS_CSV is set (local path or s3:// uri), look up
+    # the urban-sound class (label1_audioset) for THIS file so utility
+    # metrics (mAP/F1/accuracy) are computed against real ground truth.
+    # When unset → utility metrics fall back to the YAMNet confidence proxy.
+    ground_truth_label: str | None = None
+    _gt_csv = os.environ.get("GROUND_TRUTH_LABELS_CSV")
+    if _gt_csv:
+        try:
+            import csv as _csv
+            import io as _io
+
+            if _gt_csv.startswith("s3://"):
+                _rest = _gt_csv[len("s3://"):]
+                _b, _, _k = _rest.partition("/")
+                _body = boto3.client("s3").get_object(Bucket=_b, Key=_k)["Body"].read().decode()
+                _reader = _csv.DictReader(_io.StringIO(_body))
+            else:
+                _reader = _csv.DictReader(open(_gt_csv))
+
+            _base = os.path.basename(s3_key)
+            for _row in _reader:
+                # Match on full s3_key, or on fname == basename of the key
+                if _row.get("s3_key") == s3_key or _row.get("fname") == _base:
+                    ground_truth_label = (_row.get("label1_audioset") or "").strip() or None
+                    break
+            logger.info(
+                "Ground-truth label for %s: %s (source=%s)",
+                _base, ground_truth_label, _gt_csv,
+            )
+            if ground_truth_label is None:
+                logger.warning("No ground-truth row matched %s in %s", _base, _gt_csv)
+        except Exception as _gt_exc:
+            logger.warning("Failed to resolve ground-truth label: %s", _gt_exc)
+
+    # Download audio from S3
+    s3 = boto3.client("s3")
+    with tempfile.TemporaryDirectory(prefix="pipeline_") as tmpdir:
+        local_path = os.path.join(tmpdir, os.path.basename(s3_key))
+        s3.download_file(s3_bucket, s3_key, local_path)
+        logger.info(f"Downloaded to {local_path}")
+
+        # Import tools
+        from src.tools.prepare_data_tool import PrepareDataTool
+        from src.tools.speech_scan_tool import SpeechScanTool
+        from src.tools.mid_band_attenuation_tool import MidBandAttenuationTool
+        from src.tools.strong_blurring_tool import StrongBlurringTool
+        from src.tools.source_separation_tool import SourceSeparationTool
+        from src.tools.classification_tool import ClassificationTool
+        from src.tools.quality_evaluation_tool import QualityEvaluationTool
+        from src.tools.data_lake_writer import DataLakeWriter
+        from src.agents.adaptive_privacy_control_agent import AdaptivePrivacyControlAgent
+        from src.agents.llm_privacy_control_agent import LLMPrivacyControlAgent
+        from src.contracts.audio_contracts import AudioIngestRequest
+
+        # Output buckets - must be set via environment variables
+        processed_bucket = os.environ.get("PROCESSED_AUDIO_BUCKET")
+        logs_bucket = os.environ.get("LOGS_BUCKET")
+        
+        if not processed_bucket or not logs_bucket:
+            logger.error("Missing PROCESSED_AUDIO_BUCKET or LOGS_BUCKET environment variables")
+            logger.error(f"PROCESSED_AUDIO_BUCKET={processed_bucket}, LOGS_BUCKET={logs_bucket}")
+            raise SystemExit(1)
+
+        output_dir = os.path.join(tmpdir, "output")
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Initialize shared tools (read-only, can be shared)
+        speech_scan = SpeechScanTool()
+        # Optional: transfer-learned YAMNet head (urban taxonomy).
+        # Set YAMNET_TRANSFER_MODEL + YAMNET_TRANSFER_LABELS env vars
+        # (local paths or s3:// uris) to enable; otherwise raw 521-class YAMNet.
+        _tf_model = os.environ.get("YAMNET_TRANSFER_MODEL")
+        _tf_labels = os.environ.get("YAMNET_TRANSFER_LABELS")
+        if _tf_model and _tf_labels:
+            logger.info("ClassificationTool: using transfer-learned head %s", _tf_model)
+            classification = ClassificationTool(
+                transfer_model_path=_tf_model,
+                transfer_label_map=_tf_labels,
+            )
+        else:
+            classification = ClassificationTool()
+        quality = QualityEvaluationTool(use_real_models=True, ground_truth_label=ground_truth_label)
+
+        # Operative Knowledge Base for this run — these are the REAL
+        # config values the pipeline uses (recipes, thresholds, privacy
+        # formula). Defined inline (not a mock); kept in sync with the
+        # QualityEvaluationTool via the same CONTENT_*/PRIVACY_* env vars.
+        from src.knowledge_base.kb_loader import (
+            KnowledgeBase, PolicyTransformationRules, PrivacyPlaybook,
+            RecipeDefinition, SoundLabelTaxonomy,
+        )
+
+        kb = KnowledgeBase(
+            version="ecs-pipeline-1.0",
+            manifest_hash="ecs-hash",
+            policies=PolicyTransformationRules(
+                privacy_target=privacy_target,
+                allow_store_raw_audio=True,
+                max_retention_days=90,
+            ),
+            playbook=PrivacyPlaybook(
+                analyzer_required_features=["speech_ratio", "vad_conf_mean", "hf_energy_ratio", "mid_energy_ratio"],
+                evaluator_metrics=["wer", "cer", "speaker_privacy"],
+                # Privacy-score formula — kept in sync with QualityEvaluationTool
+                # via the same env vars (CONTENT_*/PRIVACY_* + CONTENT_PRIVACY_MODE).
+                privacy_score_formula={
+                    "content_privacy_mode": os.environ.get("CONTENT_PRIVACY_MODE", "wer_cer"),
+                    "wer_weight": float(os.environ.get("CONTENT_WER_WEIGHT", "0.6")),
+                    "cer_weight": float(os.environ.get("CONTENT_CER_WEIGHT", "0.4")),
+                    "content_weight": float(os.environ.get("PRIVACY_CONTENT_WEIGHT", "0.7")),
+                    "speaker_weight": float(os.environ.get("PRIVACY_SPEAKER_WEIGHT", "0.3")),
+                },
+                preserve_score_formula={"weights": {"s_loud": 0.2, "s_hf": 0.2, "s_sc": 0.2, "s_con": 0.2, "s_psy": 0.2}},
+                pass_criteria={
+                    # NEW vocabulary (renamed 2026)
+                    "moderate": {"privacy_score_min": 0.65, "preserve_score_min": 0.80},  # was "high"
+                    "high":     {"privacy_score_min": 0.80, "preserve_score_min": 0.80},  # was "very_high"
+                    # Legacy aliases — kept for back-compat with old KB / Step Function inputs
+                    "very_high": {"privacy_score_min": 0.80, "preserve_score_min": 0.80},
+                },
+                recipes=[
+                    RecipeDefinition(
+                        name="RECIPE_MID_BAND_ATTEN",
+                        params={"band_hz": [700, 2700], "atten_db": 30.0, "lowpass_cutoff": 950, "pitch_shift_semitones": -4.0},
+                        use_when={"speech_ratio": {"min": 0.0, "max": 1.0}},
+                        risks=["Insufficient privacy for high speech ratio"],
+                        mitigations=["Escalate atten_db and lower lowpass_cutoff on retry"],
+                        auto_tune_rules={"atten_db": {"step": 5.0, "max": 40.0}, "lowpass_cutoff": {"step": -100, "min": 800}},
+                    ),
+                    RecipeDefinition(
+                        name="RECIPE_LOWPASS_HIGHPASS_MIX",
+                        params={"lowpass_cutoff": 600, "lowpass_mix": 0.55, "noise_snr_db": 3.0, "band_hz": [600, 2800], "atten_db": 35.0, "pitch_shift_semitones": -5.0},
+                        use_when={"speech_ratio": {"min": 0.0, "max": 1.0}},
+                        risks=["May degrade environmental sound quality"],
+                        mitigations=["Monitor preserve_score"],
+                        auto_tune_rules={"lowpass_cutoff": {"step": -100, "min": 400}, "atten_db": {"step": 5.0, "max": 45.0}},
+                    ),
+                ],
+                selection_strategy="score_then_try",
+                max_trials=2,
+                fallback_rules={},
+                utility_preserve_target=0.80,
+            ),
+            taxonomy=SoundLabelTaxonomy(
+                classes=["Speech", "Music", "Environmental"],
+                mappings={"Speech": "human_voice", "Music": "music", "Environmental": "environment"},
+                confidence_thresholds={"default": 0.3},
+            ),
+        )
+
+        # Import Fixed Pipeline
+        from src.pipelines.fixed_baseline_pipeline import FixedBaselinePipeline
+
+        request = AudioIngestRequest(
+            source_id=s3_key,
+            raw_audio_path=local_path,
+        )
+
+        logger.info(f"RUN_MODE={run_mode_raw} → modes={run_modes}")
+
+        # Helper: create tools for a given output dir
+        def make_tools(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+            mb = MidBandAttenuationTool(output_dir=out_dir)
+            sb = StrongBlurringTool(output_dir=out_dir)
+            ss = SourceSeparationTool(output_dir=out_dir, mid_band_tool=mb, strong_blur_tool=sb)
+            return PrepareDataTool(output_dir=out_dir), mb, sb, ss, DataLakeWriter(base_path=out_dir)
+
+        reports = {}  # label -> (report, report_prefix)
+
+        # ── 1. Fixed Baseline ──
+        if should_run("fixed"):
+            logger.info("=" * 60)
+            logger.info("Running FIXED BASELINE Pipeline...")
+            logger.info("=" * 60)
+            prep, mb, sb, ss, dlw = make_tools(os.path.join(tmpdir, "output_fixed"))
+            pipe = FixedBaselinePipeline(
+                privacy_target=privacy_target, prepare_data_tool=prep,
+                speech_scan_tool=speech_scan, mid_band_tool=mb, strong_blur_tool=sb,
+                classification_tool=classification, quality_tool=quality, data_lake_writer=dlw,
+            )
+            r = pipe.run(request)
+            reports["fixed"] = r
+            logger.info(f"Fixed: {r.succeeded_chunks}/{r.total_chunks} chunks, {r.total_runtime_seconds}s")
+
+        # ── 1b. Fixed Baseline (StrongBlurring / strict target) ──
+        # NOTE (renamed 2026): privacy_target="high" is the NEW strict target
+        # (was previously called "very_high").
+        if should_run("fixed_strong"):
+            logger.info("=" * 60)
+            logger.info("Running FIXED BASELINE (StrongBlurring) Pipeline...")
+            logger.info("=" * 60)
+            prep, mb, sb, ss, dlw = make_tools(os.path.join(tmpdir, "output_fixed_strong"))
+            pipe = FixedBaselinePipeline(
+                privacy_target="high", prepare_data_tool=prep,
+                speech_scan_tool=speech_scan, mid_band_tool=mb, strong_blur_tool=sb,
+                classification_tool=classification, quality_tool=quality, data_lake_writer=dlw,
+            )
+            r = pipe.run(request)
+            reports["fixed_strong"] = r
+            logger.info(f"Fixed Strong: {r.succeeded_chunks}/{r.total_chunks} chunks, {r.total_runtime_seconds}s")
+
+        # ── 2. Adaptive Rule-Based ──
+        # ── 2. Adaptive Rule-Based (no SS) ──
+        if should_run("rule_based"):
+            logger.info("=" * 60)
+            logger.info("Running ADAPTIVE RULE-BASED Pipeline (no SS)...")
+            logger.info("=" * 60)
+            prep, mb, sb, ss, dlw = make_tools(os.path.join(tmpdir, "output_rule_based"))
+            agent = AdaptivePrivacyControlAgent(mid_band_tool=mb, strong_blur_tool=sb, quality_tool=quality, source_separation_tool=None, classification_tool=classification)
+            pipe = AgenticPipeline(
+                privacy_target=privacy_target, kb=kb, prepare_data_tool=prep,
+                speech_scan_tool=speech_scan, agent=agent,
+                classification_tool=classification, quality_tool=quality, data_lake_writer=dlw,
+            )
+            r = pipe.run(request)
+            reports["rule_based"] = r
+            logger.info(f"Rule-Based: {r.succeeded_chunks}/{r.total_chunks} chunks, {r.total_runtime_seconds}s")
+
+        # ── 2-strong. Adaptive Rule-Based with STRONG privacy target (high) ──
+        # Same agent as rule_based but privacy_target="high" (strict, 0.80) →
+        # GATE escalates harder, retry ladder bumps up for low-speech chunks.
+        if should_run("rule_based_strong"):
+            logger.info("=" * 60)
+            logger.info("Running ADAPTIVE RULE-BASED Pipeline (STRONG target=high)...")
+            logger.info("=" * 60)
+            prep, mb, sb, ss, dlw = make_tools(os.path.join(tmpdir, "output_rule_based_strong"))
+            agent = AdaptivePrivacyControlAgent(mid_band_tool=mb, strong_blur_tool=sb, quality_tool=quality, source_separation_tool=None, classification_tool=classification)
+            pipe = AgenticPipeline(
+                privacy_target="high", kb=kb, prepare_data_tool=prep,
+                speech_scan_tool=speech_scan, agent=agent,
+                classification_tool=classification, quality_tool=quality, data_lake_writer=dlw,
+            )
+            r = pipe.run(request)
+            reports["rule_based_strong"] = r
+            logger.info(f"Rule-Based Strong: {r.succeeded_chunks}/{r.total_chunks} chunks, {r.total_runtime_seconds}s")
+
+        # ── 2b. Adaptive Rule-Based (with SS) ──
+        if should_run("rule_based_ss"):
+            logger.info("=" * 60)
+            logger.info("Running ADAPTIVE RULE-BASED Pipeline (with SS)...")
+            logger.info("=" * 60)
+            prep, mb, sb, ss, dlw = make_tools(os.path.join(tmpdir, "output_rule_based_ss"))
+            # SS DISABLED globally → force source_separation_tool=None
+            agent = AdaptivePrivacyControlAgent(mid_band_tool=mb, strong_blur_tool=sb, quality_tool=quality, source_separation_tool=None, classification_tool=classification)
+            pipe = AgenticPipeline(
+                privacy_target=privacy_target, kb=kb, prepare_data_tool=prep,
+                speech_scan_tool=speech_scan, agent=agent,
+                classification_tool=classification, quality_tool=quality, data_lake_writer=dlw,
+            )
+            r = pipe.run(request)
+            reports["rule_based_ss"] = r
+            logger.info(f"Rule-Based SS: {r.succeeded_chunks}/{r.total_chunks} chunks, {r.total_runtime_seconds}s")
+
+        # ── 3. Adaptive LLM (no memory) ──
+        if should_run("llm_no_memory"):
+            logger.info("=" * 60)
+            logger.info("Running ADAPTIVE LLM (NO MEMORY) Pipeline...")
+            logger.info("=" * 60)
+            prep, mb, sb, ss, dlw = make_tools(os.path.join(tmpdir, "output_llm_no_mem"))
+            from src.agents.llm_no_memory_agent import LLMNoMemoryAgent
+            # SS DISABLED globally → force source_separation_tool=None
+            agent = LLMNoMemoryAgent(mid_band_tool=mb, strong_blur_tool=sb, quality_tool=quality, source_separation_tool=None, classification_tool=classification)
+            pipe = AgenticPipeline(
+                privacy_target=privacy_target, kb=kb, prepare_data_tool=prep,
+                speech_scan_tool=speech_scan, agent=agent,
+                classification_tool=classification, quality_tool=quality, data_lake_writer=dlw,
+            )
+            r = pipe.run(request)
+            reports["llm_no_memory"] = r
+            logger.info(f"LLM No Memory: {r.succeeded_chunks}/{r.total_chunks} chunks, {r.total_runtime_seconds}s")
+
+        # ── 4. Adaptive LLM (with memory, with SS) ──
+        if should_run("llm_with_memory"):
+            logger.info("=" * 60)
+            logger.info("Running ADAPTIVE LLM (WITH MEMORY) Pipeline...")
+            logger.info("=" * 60)
+            prep, mb, sb, ss, dlw = make_tools(os.path.join(tmpdir, "output_llm_with_mem"))
+            # SS DISABLED globally → force source_separation_tool=None
+            agent = LLMPrivacyControlAgent(mid_band_tool=mb, strong_blur_tool=sb, quality_tool=quality, source_separation_tool=None, classification_tool=classification)
+            pipe = AgenticPipeline(
+                privacy_target=privacy_target, kb=kb, prepare_data_tool=prep,
+                speech_scan_tool=speech_scan, agent=agent,
+                classification_tool=classification, quality_tool=quality, data_lake_writer=dlw,
+            )
+            r = pipe.run(request)
+            reports["llm_with_memory"] = r
+            logger.info(f"LLM With Memory: {r.succeeded_chunks}/{r.total_chunks} chunks, {r.total_runtime_seconds}s")
+
+        # ── 5. Adaptive LLM (with memory, no SS) ──
+        if should_run("llm_with_memory_no_ss"):
+            logger.info("=" * 60)
+            logger.info("Running ADAPTIVE LLM (WITH MEMORY, NO SS) Pipeline...")
+            logger.info("=" * 60)
+            prep, mb, sb, _ss, dlw = make_tools(os.path.join(tmpdir, "output_llm_with_mem_no_ss"))
+            agent = LLMPrivacyControlAgent(mid_band_tool=mb, strong_blur_tool=sb, quality_tool=quality, source_separation_tool=None, classification_tool=classification)
+            pipe = AgenticPipeline(
+                privacy_target=privacy_target, kb=kb, prepare_data_tool=prep,
+                speech_scan_tool=speech_scan, agent=agent,
+                classification_tool=classification, quality_tool=quality, data_lake_writer=dlw,
+            )
+            r = pipe.run(request)
+            reports["llm_with_memory_no_ss"] = r
+            logger.info(f"LLM With Memory No SS: {r.succeeded_chunks}/{r.total_chunks} chunks, {r.total_runtime_seconds}s")
+
+        # ── 6. Adaptive LLM (no memory, no source separation) ──
+        if should_run("llm_no_memory_no_ss"):
+            logger.info("=" * 60)
+            logger.info("Running ADAPTIVE LLM (NO MEMORY, NO SS) Pipeline...")
+            logger.info("=" * 60)
+            prep, mb, sb, _ss, dlw = make_tools(os.path.join(tmpdir, "output_llm_no_mem_no_ss"))
+            from src.agents.llm_no_memory_agent import LLMNoMemoryAgent
+            # No source_separation_tool → agent cannot select source separation
+            agent_no_ss = LLMNoMemoryAgent(mid_band_tool=mb, strong_blur_tool=sb, quality_tool=quality, source_separation_tool=None, classification_tool=classification)
+            pipe = AgenticPipeline(
+                privacy_target=privacy_target, kb=kb, prepare_data_tool=prep,
+                speech_scan_tool=speech_scan, agent=agent_no_ss,
+                classification_tool=classification, quality_tool=quality, data_lake_writer=dlw,
+            )
+            r = pipe.run(request)
+            reports["llm_no_memory_no_ss"] = r
+            logger.info(f"LLM No Memory No SS: {r.succeeded_chunks}/{r.total_chunks} chunks, {r.total_runtime_seconds}s")
+
+        # ============================================================
+        # Upload results to S3
+        # ============================================================
+        import json
+
+        for label, report in reports.items():
+            # Upload processed audio
+            for path in report.persisted_paths or []:
+                if os.path.exists(path):
+                    s3_output_key = f"processed/{label}/{s3_key}/{os.path.basename(path)}"
+                    s3.upload_file(path, processed_bucket, s3_output_key)
+                    logger.info(f"Uploaded {label}: s3://{processed_bucket}/{s3_output_key}")
+
+            # Upload report JSON
+            report_json = report.model_dump_json(indent=2)
+            report_key = f"reports/{label}/{s3_key.replace('.wav', '')}_report.json"
+            s3.put_object(Bucket=logs_bucket, Key=report_key, Body=report_json, ContentType="application/json")
+            logger.info(f"Uploaded {label} report: s3://{logs_bucket}/{report_key}")
+
+        logger.info("=" * 60)
+        logger.info("SUMMARY:")
+        for label, report in reports.items():
+            logger.info(f"  {label}: {report.succeeded_chunks}/{report.total_chunks} chunks, {report.total_runtime_seconds}s")
+        logger.info("=" * 60)
