@@ -1,0 +1,11 @@
+# Extra deps installed into the SageMaker TensorFlow training container.
+# The base container already provides tensorflow (2.13) + numpy + pandas + boto3.
+# We only add what the training script imports on top of that.
+#
+# tensorflow-hub 0.14.0 is the last release that targets the Keras-2 API used
+# by the TF 2.13 container (0.16+ pulls in tf-keras / Keras-3 and can break the
+# YAMNet hub.load path). Pin it explicitly.
+tensorflow-hub==0.14.0
+soundfile>=0.12.1
+scipy>=1.10
+scikit-learn>=1.2
